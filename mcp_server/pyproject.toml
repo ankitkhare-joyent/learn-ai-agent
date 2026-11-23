@@ -1,0 +1,20 @@
+[project]
+name = "ec2-inventory-mcp"
+version = "0.1.0"
+description = "MCP server exposing the EC2 inventory REST API as tools"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "mcp>=2.3.0",
+    "httpx>=0.28",
+    "pyjwt[crypto]>=2.15",
+    "pydantic-settings>=2.11",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.4", "pytest-asyncio>=1.2"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

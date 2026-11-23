@@ -1,0 +1,5 @@
+**
+!mcp_server/pyproject.toml
+!mcp_server/uv.lock
+!mcp_server/server.py
+!scripts/bao_exec.py

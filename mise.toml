@@ -1,0 +1,91 @@
+# mise: one file for this project's tools, environment and tasks (docs/10-mise-and-uv.md).
+#   cd learn-ai-agent        -> right Python + uv on PATH, .env loaded, .venv activated
+#   mise run up | seed | test | agent:langgraph "question" | ...    (mise tasks to list them)
+
+[tools]
+python = "3.13.16"
+uv = "0.12.22"
+
+[env]
+_.file = ".env"                                        # ANTHROPIC_API_KEY etc. (git-ignored)
+_.python.venv = { path = ".venv", create = true }      # uv's project venv, activated automatically
+UV_PYTHON = "3.13.16"                                  # make uv use the mise-managed interpreter
+BAO_ADDR = "http://localhost:8200"
+MCP_URL = "http://localhost:8001/mcp"
+INVENTORY_API_URL = "http://localhost:8000"
+
+[tasks.sync]
+description = "Install Python dependencies from uv.lock"
+run = "uv sync --locked"
+
+[tasks.up]
+description = "Start OpenBao, S3, catalog, API and MCP server (builds images)"
+run = "docker compose up -d --build --wait api mcp"
+
+[tasks.seed]
+description = "Generate 6 months of EC2 snapshots and load them into Iceberg (~4 min)"
+run = "docker compose --profile seed run --rm seed"
+
+[tasks.down]
+description = "Stop everything (keeps data)"
+run = "docker compose down"
+
+[tasks.reset]
+description = "Stop everything and DELETE all data, secrets included"
+run = "docker compose down -v && rm -f .bao/dev-token"
+
+[tasks.unseal]
+description = "Unseal OpenBao after a restart (re-runs the idempotent init)"
+run = "docker compose run --rm bao-init"
+
+[tasks.test]
+description = "Run the test suite against the running stack"
+depends = ["sync"]
+run = "pytest -q"
+
+[tasks.lint]
+run = "ruff check ."
+
+[tasks.set-anthropic-key]
+description = "Store your Anthropic API key in OpenBao (prompted, not echoed)"
+run = '''
+read -rsp "Anthropic API key: " KEY && echo &&
+python -c "import sys; from agents.secrets import write_secret; write_secret('ec2-lakehouse/anthropic', {'api_key': sys.argv[1]})" "$KEY" &&
+echo "stored in OpenBao at secret/ec2-lakehouse/anthropic"
+'''
+
+[tasks.admin-password]
+description = "Print the API admin password (for Swagger UI at http://localhost:8000/docs)"
+run = "python -c \"from agents.secrets import read_secret; print(read_secret('ec2-lakehouse/admin')['password'])\""
+
+[tasks."agent:raw"]
+description = "No-framework agent: Claude API + MCP client + a loop"
+run = "python -m agents.raw_loop"
+
+[tasks."agent:langgraph"]
+description = "LangGraph agent (add --chat for multi-turn)"
+run = "python -m agents.langgraph_agent"
+
+[tasks."agent:strands"]
+description = "Strands Agents SDK agent"
+run = "python -m agents.strands_agent"
+
+[tasks."agent:skills"]
+description = "Raw-loop agent that discovers and loads Agent Skills from skills/"
+run = "python -m agents.skills_agent"
+
+[tasks.bench]
+description = "Benchmark DuckDB / PyIceberg / Polars / hot cache on the Iceberg table (in a container)"
+run = "docker compose --profile seed run --rm --no-deps seed python scripts/bao_exec.py python -m scripts.bench_engines"
+
+[tasks."lab:duck"]
+description = "DuckDB on your laptop, attached to the lakehouse (lab/duck.py; the hands-on track uses it)"
+run = "python -m lab.duck"
+
+[tasks."lab:scan"]
+description = "PyIceberg on your laptop: load ec2.instances from the catalog and scan one snapshot (lab/iceberg_scan.py)"
+run = "python -m lab.iceberg_scan"
+
+[tasks."lab:oops"]
+description = "Break the table on purpose: append the latest snapshot's rows twice (lab/04; fix: re-run the ETL)"
+run = "python -m lab.oops_append"

@@ -1,0 +1,62 @@
+[project]
+name = "learn-ai-agent"
+version = "0.1.0"
+description = "EC2 inventory lakehouse + REST API + MCP server + AI agents, for learning agentic AI"
+requires-python = ">=3.13,<3.14"
+dependencies = []
+
+# One project, several deployables. Each Docker image installs only its group:
+#   uv sync --locked --no-dev --group api
+[dependency-groups]
+pipeline = [
+    "cryptography>=46",   # init_openbao.py generates the API's RSA signing key
+    "pyarrow>=25.0",
+    "pyiceberg[pyarrow,pyiceberg-core]>=0.12.0",
+    "duckdb>=1.5.6",
+    "polars>=1.44",       # only for scripts/bench_engines.py
+]
+api = [
+    "fastapi>=0.142",
+    "uvicorn[standard]>=0.54",
+    "python-multipart>=0.0.20",
+    "pydantic-settings>=2.11",
+    "pyjwt[crypto]>=2.15",
+    "pwdlib[argon2]>=0.3.1",
+    "duckdb>=1.5.6",
+    "pyarrow>=25.0",
+    "pyiceberg[pyarrow,pyiceberg-core]>=0.12.0",
+]
+# The MCP *server* is a separate uv project (mcp_server/) on the MCP Python SDK v2.
+# Agent frameworks still pin the v1 client (mcp<2): a v1 client talks to a v2 server
+# fine, because v2 servers answer both protocol revisions.
+agents = [
+    "mcp>=1.24,<2",
+    "httpx>=0.28",
+    "anthropic>=0.125,<1",   # Strands still pins the 0.x SDK; 1.x (httpx2-based) is out but not usable here yet
+    "langgraph>=1.2.12",
+    "langchain-core>=1.6",
+    "langchain-mcp-adapters>=0.3.2",
+    "langchain-ollama>=1.1",
+    "langchain-anthropic>=1.7",
+    "strands-agents[ollama,anthropic]>=1.57",
+]
+dev = [
+    "pytest>=8.4",
+    "pytest-asyncio>=1.2",
+    "ruff>=0.14",
+    { include-group = "pipeline" },
+    { include-group = "api" },
+    { include-group = "agents" },
+]
+
+[tool.uv]
+default-groups = ["dev"]
+package = false
+
+[tool.ruff]
+line-length = 120
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]

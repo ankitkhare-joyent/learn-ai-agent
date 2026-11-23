@@ -1,0 +1,19 @@
+.env
+.venv/
+**/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.bao/
+# never commit secrets or local state
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*kubeconfig*
+*.tfstate*
+*.db
+data/
+.DS_Store

@@ -1,0 +1,177 @@
+# Local EC2-inventory lakehouse + REST API + MCP server, with secrets in OpenBao.
+#
+#   OpenBao (secrets) ──► every service below gets its credentials at start-up, nothing secret lives here
+#   S3 (SeaweedFS) <- Iceberg REST catalog (Lakekeeper + Postgres) <- REST API (FastAPI + DuckDB) <- MCP server <- agents
+#
+# Start:  mise run up        Seed data:  mise run seed        Tests:  mise run test
+name: ec2-lakehouse
+
+x-lake-env: &lake-env
+  ICEBERG_REST_URI: http://lakekeeper:8181/catalog
+  ICEBERG_WAREHOUSE: lakehouse
+  S3_ENDPOINT: http://seaweedfs:8333
+  S3_ENDPOINT_HOSTPORT: seaweedfs:8333
+  S3_REGION: us-east-1
+  BAO_ADDR: http://openbao:8200
+
+# Which OpenBao secrets become which env vars (read by scripts/bao_exec.py before the app starts).
+x-s3-secrets: &s3-secrets "S3_ACCESS_KEY=ec2-lakehouse/s3#access_key;S3_SECRET_KEY=ec2-lakehouse/s3#secret_key"
+
+# "Secret zero": the few bootstrap values that can't come from OpenBao because they are needed to reach it
+# or to start it. In Kubernetes these come from the platform (Kubernetes auth, KMS auto-unseal), not a file.
+x-lakekeeper-env: &lakekeeper-env
+  LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:lakekeeper@postgres:5432/lakekeeper
+  LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:lakekeeper@postgres:5432/lakekeeper
+  # Encrypts the warehouse storage credentials Lakekeeper keeps in Postgres.
+  # (Lakekeeper can keep them in Vault KV2 instead, but v0.13.6 fails OpenBao's health check:
+  # its Vault client requires a `performance_standby` field that OpenBao doesn't return. See docs/09.)
+  LAKEKEEPER__PG_ENCRYPTION_KEY: local-dev-only-not-a-real-secret
+
+services:
+  # ------------------------------------------------------------------ secrets
+  openbao:
+    image: openbao/openbao:2.6.2
+    command: ["server", "-config=/openbao/config/config.hcl"]
+    ports: ["8200:8200"]                 # API + UI: http://localhost:8200/ui
+    volumes:
+      - bao-data:/openbao/file
+      - ./stack/openbao/config.hcl:/openbao/config/config.hcl:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null 'http://127.0.0.1:8200/v1/sys/health?sealedcode=200&uninitcode=200' || exit 1"]
+      interval: 3s
+      retries: 30
+    mem_limit: 256m
+
+  # Init + unseal + policies + AppRoles + generated secrets. Runs on every `up`; idempotent.
+  bao-init:
+    build: { context: ., args: { GROUP: pipeline } }
+    image: ec2-lakehouse/pipeline:dev
+    command: ["python", "-m", "scripts.init_openbao"]
+    user: "10001"
+    environment:
+      BAO_ADDR: http://openbao:8200
+    volumes:
+      - bao-keys:/bao-keys               # unseal key + root token: LOCAL ONLY (prod: KMS auto-unseal)
+      - bao-creds:/creds                 # per-service AppRole credentials, mounted into each service below
+      - ./.bao:/dev-out                  # developer token for agents on the host (git-ignored)
+    depends_on:
+      openbao: { condition: service_healthy }
+
+  # ------------------------------------------------------------------ storage + catalog
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.48
+    command: ["mini", "-dir=/data", "-s3.config=/creds/iam.json"]
+    ports: ["9000:8333", "9001:23646"]   # S3 API, admin UI
+    volumes:
+      - s3-data:/data
+      - { type: volume, source: bao-creds, target: /creds, read_only: true, volume: { subpath: seaweedfs } }
+    depends_on:
+      bao-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8333/status || exit 1"]
+      interval: 5s
+      retries: 30
+    mem_limit: 1536m
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: lakekeeper
+      POSTGRES_PASSWORD: lakekeeper
+      POSTGRES_DB: lakekeeper
+    volumes: [pg-data:/var/lib/postgresql]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "lakekeeper", "-d", "lakekeeper"]
+      interval: 3s
+      retries: 30
+    mem_limit: 512m
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:v0.13.6
+    command: ["migrate"]
+    environment: *lakekeeper-env
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:v0.13.6
+    command: ["serve"]
+    environment: *lakekeeper-env
+    ports: ["8181:8181"]                 # Iceberg REST: /catalog   UI: /ui
+    depends_on:
+      lakekeeper-migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 5s
+      retries: 30
+    mem_limit: 512m
+
+  # Creates the buckets, bootstraps Lakekeeper and the "lakehouse" warehouse (idempotent).
+  init:
+    image: ec2-lakehouse/pipeline:dev
+    command: ["python", "scripts/bao_exec.py", "python", "-m", "scripts.init_lakehouse"]
+    environment: { <<: *lake-env, BAO_SECRETS: *s3-secrets }
+    volumes: [{ type: volume, source: bao-creds, target: /creds, read_only: true, volume: { subpath: pipeline } }]
+    depends_on:
+      seaweedfs: { condition: service_healthy }
+      lakekeeper: { condition: service_healthy }
+
+  # One-off: `mise run seed` (generate 6 months of raw data + ETL into Iceberg)
+  seed:
+    image: ec2-lakehouse/pipeline:dev
+    profiles: ["seed"]
+    command: ["python", "scripts/bao_exec.py", "sh", "-c",
+              "python -m pipeline.generate_raw --processes 2 && python -m pipeline.load_iceberg"]
+    environment: { <<: *lake-env, BAO_SECRETS: *s3-secrets }
+    volumes: [{ type: volume, source: bao-creds, target: /creds, read_only: true, volume: { subpath: pipeline } }]
+    depends_on:
+      init: { condition: service_completed_successfully }
+    mem_limit: 4g
+
+  # ------------------------------------------------------------------ serving
+  api:
+    build: { context: ., args: { GROUP: api } }
+    image: ec2-lakehouse/api:dev
+    command: ["python", "scripts/bao_exec.py",
+              "uvicorn", "api.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2", "--no-access-log"]
+    ports: ["8000:8000"]                 # Swagger UI: http://localhost:8000/docs
+    environment:
+      <<: *lake-env
+      API_USERS_DB: /data/users.db
+      BAO_SECRETS: >-
+        API_JWT_PRIVATE_KEY=ec2-lakehouse/api#jwt_private_key;API_ADMIN_PASSWORD=ec2-lakehouse/admin#password;
+        API_MCP_CLIENT_SECRET=ec2-lakehouse/mcp-client#client_secret;
+        API_AGENT_USERNAME=ec2-lakehouse/agent#username;API_AGENT_PASSWORD=ec2-lakehouse/agent#password;
+        S3_ACCESS_KEY=ec2-lakehouse/s3#access_key;S3_SECRET_KEY=ec2-lakehouse/s3#secret_key
+    volumes:
+      - api-data:/data
+      - { type: volume, source: bao-creds, target: /creds, read_only: true, volume: { subpath: api } }
+    depends_on:
+      init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      interval: 5s
+      retries: 30
+    mem_limit: 2g
+
+  mcp:
+    build: { context: ., dockerfile: mcp_server/Dockerfile }
+    image: ec2-lakehouse/mcp:dev
+    ports: ["8001:8001"]                 # MCP endpoint: http://localhost:8001/mcp
+    environment:
+      BAO_ADDR: http://openbao:8200
+      MCP_API_BASE_URL: http://api:8000
+      MCP_JWKS_URL: http://api:8000/.well-known/jwks.json
+      BAO_SECRETS: "MCP_CLIENT_SECRET=ec2-lakehouse/mcp-client#client_secret"
+    volumes: [{ type: volume, source: bao-creds, target: /creds, read_only: true, volume: { subpath: mcp } }]
+    depends_on:
+      api: { condition: service_healthy }
+    mem_limit: 512m
+
+volumes:
+  bao-data:
+  bao-keys:
+  bao-creds:
+  s3-data:
+  pg-data:
+  api-data:
